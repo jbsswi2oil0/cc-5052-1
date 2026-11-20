@@ -31,6 +31,21 @@ WALLS = [
     (420, 200, 26, 170),
 ]
 
+# 斜坡线段 (x0, y0) -> (x1, y1)：从地面 (120,606) 升到 (300,500)。
+# 角色圆心进入坡面一个半径内时被吸附到坡面（确定性，无弹性），
+# 该拍状态里 on_slope=1。坡顶与墙体 (200,430,300,26) 底边相距 44px，
+# 大于吸附半径，两处碰撞互不影响。
+SLOPE = (120.0, 606.0, 300.0, 500.0)
+
+
+def slope_surface_y(x):
+    """x 处坡面高度；不在坡段水平范围内返回 None。"""
+    x0, y0, x1, y1 = SLOPE
+    if x < min(x0, x1) or x > max(x0, x1):
+        return None
+    t = (x - x0) / (x1 - x0)
+    return y0 + t * (y1 - y0)
+
 
 def initial_state():
     """权威初始状态。显示位置与碰撞体位置是同一个 x/y，不做分离。"""
@@ -38,6 +53,7 @@ def initial_state():
         "x": SPAWN[0],
         "y": SPAWN[1],
         "step": 0,
+        "on_slope": 0,
     }
 
 
@@ -105,10 +121,18 @@ def step(state, inp):
     # 墙体碰撞（碰撞体与显示体同一坐标，校正时一起移动）
     nx, ny = _circle_vs_walls(nx, ny)
 
+    # 坡面吸附：圆心距坡面一个半径内时贴到坡面上（纯位置约束）
+    on_slope = 0
+    sy = slope_surface_y(nx)
+    if sy is not None and abs(ny - sy) <= RADIUS:
+        ny = sy
+        on_slope = 1
+
     return {
         "x": nx,
         "y": ny,
         "step": state["step"] + 1,
+        "on_slope": on_slope,
     }
 
 
@@ -121,4 +145,6 @@ def replay(state, inputs):
 
 def state_hash(state):
     """跨进程比对状态用的紧凑指纹。"""
-    return "s%d@(%.3f,%.3f)" % (state["step"], state["x"], state["y"])
+    return "s%d@(%.3f,%.3f)%s" % (
+        state["step"], state["x"], state["y"],
+        "S" if state.get("on_slope") else "-")

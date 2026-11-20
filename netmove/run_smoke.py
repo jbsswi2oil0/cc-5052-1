@@ -112,6 +112,8 @@ def main():
         cfg = ctrl.snap.get("cfg", {})
 
         print("\n===== 冒烟结果 =====")
+        print("协商: v%d caps=%s seq_mod=%d"
+              % (snap["version"], snap["caps"], snap["seq_mod"]))
         print("代理配置:", json.dumps(cfg, ensure_ascii=False))
         print("代理统计:", json.dumps(stats, ensure_ascii=False))
         print("客户端:", sim.state_hash(snap["state"]),

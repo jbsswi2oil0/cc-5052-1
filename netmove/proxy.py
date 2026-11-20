@@ -57,6 +57,10 @@ class Proxy:
             "reorder_p": 0.0,
             "burst_left": 0,
         }
+        # 暂停转发（游戏视图“暂停双方”）：hold 期间只排队不投递，
+        # 恢复时把所有排队报文的到期时间整体顺延，不制造集中突发
+        self.held = False
+        self._hold_since = 0.0
         self.heap = []  # (due_monotonic, raw_bytes, dst_addr, tag)
         self.stats = {
             "up_recv": 0, "up_sent": 0, "up_dropped": 0,
@@ -121,6 +125,8 @@ class Proxy:
                        (due, self._next_id, raw, dst, sent_key, out_sock))
 
     def _pump(self):
+        if self.held:
+            return
         now = time.monotonic()
         while self.heap and self.heap[0][0] <= now:
             _, _, raw, dst, sent_key, out_sock = heapq.heappop(self.heap)
@@ -172,6 +178,21 @@ class Proxy:
             n = max(0, int(cmd.get("n", 3)))
             self.cfg["burst_left"] += n
             self.log("手动突发丢包: 接下来 %d 个上行报文" % n)
+        elif action == "hold":
+            on = bool(cmd.get("on"))
+            if on and not self.held:
+                self.held = True
+                self._hold_since = time.monotonic()
+                self.log("暂停转发：双方链路冻结（报文只排队不投递）")
+            elif not on and self.held:
+                self.held = False
+                dt = time.monotonic() - self._hold_since
+                if self.heap:
+                    self.heap = [(due + dt, i, raw, dst, k, s)
+                                 for (due, i, raw, dst, k, s) in self.heap]
+                    heapq.heapify(self.heap)
+                self.log("恢复转发：%d 条排队报文到期时间顺延 %.2fs"
+                         % (len(self.heap), dt))
         elif action == "reset_stats":
             for k in self.stats:
                 self.stats[k] = 0

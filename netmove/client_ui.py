@@ -71,6 +71,10 @@ class ProxyControl:
     def burst(self, n=3):
         self._send({"a": "burst", "n": n})
 
+    def hold(self, on):
+        """暂停/恢复转发（“暂停双方”：链路冻结，报文只排队）。"""
+        self._send({"a": "hold", "on": 1 if on else 0})
+
     def reset_stats(self):
         self._send({"a": "reset_stats"})
 
@@ -145,6 +149,8 @@ class ClientUI:
         self.ctrl = ProxyControl()
         self.smoke = smoke
         self.smoke_frames = 0
+        self.paused = False             # 暂停双方（本地停拍 + 代理冻结链路）
+        self.checkpoint_path = Path("netmove_checkpoint.json")
 
         # 渲染层坐标（仅画面平滑用，不参与模拟/碰撞）
         self.render_pos = (sim.initial_state()["x"], sim.initial_state()["y"])
@@ -172,6 +178,14 @@ class ClientUI:
             "burst3": Button((0, 0, 135, 28), "突发丢包 x3"),
             "burst8": Button((0, 0, 135, 28), "突发丢包 x8"),
             "reset": Button((0, 0, 135, 28), "清零代理统计"),
+        }
+        # 第二排：迁移调试按钮（暂停双方 / 逐拍 / 交换迟到旧包 / 检查点）
+        self.debug_buttons = {
+            "pause": Button((0, 0, 105, 26), "暂停双方"),
+            "step": Button((0, 0, 105, 26), "逐拍"),
+            "inject": Button((0, 0, 105, 26), "注入迟到旧包"),
+            "save": Button((0, 0, 105, 26), "存检查点"),
+            "load": Button((0, 0, 105, 26), "读检查点"),
         }
 
     # ------------------------------------------------------------------
@@ -213,6 +227,16 @@ class ClientUI:
         for (wx, wy, ww, wh) in sim.WALLS:
             pygame.draw.rect(self.screen, (110, 120, 140),
                              (sx0 + wx, sy0 + wy, ww, wh), border_radius=3)
+        # 斜坡（接触时高亮）
+        on_slope = bool(snap["state"].get("on_slope"))
+        x0, y0, x1, y1 = sim.SLOPE
+        slope_col = (230, 200, 90) if on_slope else (90, 140, 110)
+        pygame.draw.line(self.screen, slope_col,
+                         (sx0 + x0, sy0 + y0), (sx0 + x1, sy0 + y1), 4)
+        pygame.draw.circle(self.screen, slope_col,
+                           (int(sx0 + x0), int(sy0 + y0)), 3)
+        pygame.draw.circle(self.screen, slope_col,
+                           (int(sx0 + x1), int(sy0 + y1)), 3)
         # 权威幽灵（服务端认可位置）
         auth = snap["authoritative"]
         if auth:
@@ -240,9 +264,17 @@ class ClientUI:
         pygame.draw.circle(self.screen, (255, 255, 255),
                            (int(sx0 + rx), int(sy0 + ry)),
                            int(sim.RADIUS), 1)
+        if on_slope:
+            pygame.draw.circle(self.screen, (230, 200, 90),
+                               (int(sx0 + rx), int(sy0 + ry)),
+                               int(sim.RADIUS) + 4, 2)
 
-        head = self.f_md.render("运动场景（圆=本地预测/碰撞体，绿圈=服务端权威）",
-                                True, (220, 220, 220))
+        head_text = "运动场景（圆=本地预测/碰撞体，绿圈=服务端权威）"
+        if self.paused:
+            head_text += "  [已暂停]"
+        if on_slope:
+            head_text += "  坡面接触!"
+        head = self.f_md.render(head_text, True, (220, 220, 220))
         self.screen.blit(head, (sx0, sy0 + sim.ARENA_H + 6))
         tip = self.f_sm.render("WASD/方向键移动 · 圆与碰撞体同坐标，校正时一起移动",
                                True, (150, 150, 160))
@@ -267,9 +299,19 @@ class ClientUI:
         line("客户端（预测内核）", (240, 200, 110), self.f_lg)
         st = snap["state"]
         line("模拟步 step=%d   下一条 seq=%d" % (st["step"], snap["next_seq"]))
-        line("模拟/碰撞坐标 (%.1f, %.1f)" % (st["x"], st["y"]))
-        line("渲染坐标(仅平滑) (%.1f, %.1f)" % self.render_pos, (150, 150, 160))
-        line("ack 到达序(最近): %s" % (snap["ack_order"][-6:] or "尚无"))
+        line("协商 v%d %s mod=%d 纪元=%d"
+             % (snap["version"],
+                ("+".join(snap["caps"]) or "legacy"),
+                snap["seq_mod"], snap["epoch"]),
+             (150, 200, 230) if snap["version"] == 2 else (200, 170, 120),
+             self.f_tiny)
+        line("模拟/碰撞坐标 (%.1f, %.1f)  渲染 %.1f,%.1f"
+             % (st["x"], st["y"], self.render_pos[0], self.render_pos[1]))
+        line("落点(当前模拟) (%.1f, %.1f)  坡面接触: %s"
+             % (st["x"], st["y"], "是" if st.get("on_slope") else "否"),
+             (230, 200, 90) if st.get("on_slope") else (170, 170, 180))
+        line("ack 到达序(最近): %s" % (snap["ack_order"][-6:] or "尚无"),
+             font=self.f_tiny)
         if snap["degraded"]:
             line("链路告警: 是（%.0fms 无确认，预测继续）"
                  % ((time.monotonic() - self.kernel.last_ack_time) * 1000),
@@ -285,13 +327,20 @@ class ClientUI:
                  % (auth["x"], auth["y"], auth["step"]))
         else:
             line("权威坐标: 等待首个 ack…", (160, 160, 160))
-        line("已确认 ack_seq=%s   服务端 gap=%s"
+        line("已确认前缀=%s   服务端 gap=%s"
              % (snap["ack_seq"], snap["server_gap"]),
              (230, 150, 90) if snap["server_gap"] else (210, 210, 215))
+        extras = snap.get("ack_extras") or []
+        line("缺口散点确认: %s" % (extras[:6] if extras else "无"),
+             (230, 190, 120) if extras else (160, 160, 170), self.f_tiny)
         line("缺口起点: %s" % (snap.get("server_gaps") or "无"),
              font=self.f_tiny)
         line("已补齐缺失序号: %s" % (snap["server_drops"] or "无"),
              font=self.f_tiny)
+        if snap.get("fsreq_count"):
+            line("旧端重同步: %d 次 最近=%s"
+                 % (snap["fsreq_count"], snap.get("last_fsreq")),
+                 (240, 160, 120), self.f_tiny)
 
         gap()
         err = snap["pred_error"]
@@ -300,14 +349,17 @@ class ClientUI:
         line("历史最大误差: %.2f px" % snap["max_error"])
 
         gap()
-        line("未确认队列 pending（%d 条，最多显示 5）"
+        line("未确认队列 pending（%d 条，最多显示 4）"
              % len(snap["pending"]), (140, 180, 240), self.f_md)
-        for e in snap["pending"][:5]:
-            line("  seq=%d 向量(%d,%d) 已发%d次 重传%d"
-                 % (e["seq"], e["inp"]["dx"], e["inp"]["dy"],
-                    e["sent"], e["retrans"]), (180, 190, 210), self.f_tiny)
-        if len(snap["pending"]) > 5:
-            line("  …另有 %d 条" % (len(snap["pending"]) - 5), font=self.f_tiny)
+        for e in snap["pending"][:4]:
+            mark = " ←缺口保留" if e.get("hole") else ""
+            line("  seq=%d(短%d) 向量(%d,%d) 已发%d次 重传%d%s"
+                 % (e["seq_full"], e["seq"], e["inp"]["dx"], e["inp"]["dy"],
+                    e["sent"], e["retrans"], mark),
+                 (230, 200, 120) if e.get("hole") else (180, 190, 210),
+                 self.f_tiny)
+        if len(snap["pending"]) > 4:
+            line("  …另有 %d 条" % (len(snap["pending"]) - 4), font=self.f_tiny)
 
         gap(8)
         line("本地代理损伤调节（TCP 控制通道）", (200, 160, 220), self.f_md)
@@ -347,7 +399,25 @@ class ClientUI:
                 self.f_sm.render(btn.label, True, (235, 235, 240)),
                 (btn.rect.centerx - tw // 2, btn.rect.y + 6))
             bx += 145
-        y += 36
+        y += 32
+        bx = x
+        for key, btn in self.debug_buttons.items():
+            label = btn.label
+            if key == "pause" and self.paused:
+                label = "继续双方"
+            active = (key == "pause" and self.paused)
+            btn.rect.update(bx, y, 105, 24)
+            pygame.draw.rect(self.screen,
+                             (96, 84, 60) if active else (60, 66, 80),
+                             btn.rect, border_radius=5)
+            pygame.draw.rect(self.screen, (140, 145, 160), btn.rect, 1,
+                             border_radius=5)
+            tw = self.f_tiny.size(label)[0]
+            self.screen.blit(
+                self.f_tiny.render(label, True, (235, 235, 240)),
+                (btn.rect.centerx - tw // 2, btn.rect.y + 6))
+            bx += 112
+        y += 30
 
         line("代理统计 上行 收%d/发%d/丢%d 乱序%d"
              % (stats.get("up_recv", 0), stats.get("up_sent", 0),
@@ -362,14 +432,65 @@ class ClientUI:
 
         gap(6)
         line("事件（内核/校正）", (240, 200, 110), self.f_md)
-        for ev in snap["events"][:4]:
+        for ev in snap["events"][:3]:
             line(ev, (185, 190, 200), self.f_tiny)
         for ev in self.ui_log[:2]:
             line(ev, (230, 150, 120), self.f_tiny)
-        for ev in self.ctrl.snapshot.get("events", [])[:2]:
+        for ev in self.ctrl.snapshot.get("events", [])[:1]:
             line("proxy: " + ev, (190, 160, 210), self.f_tiny)
 
     # ------------------------------------------------------------------
+    def _toggle_pause(self):
+        self.paused = not self.paused
+        self.ctrl.hold(self.paused)
+        self.ui_log.insert(0, "已暂停双方（链路冻结）" if self.paused
+                           else "已恢复双方")
+        del self.ui_log[6:]
+
+    def _step_once(self):
+        """暂停状态下逐拍推进一拍，便于检查待处理输入与坡面接触。"""
+        if not self.paused:
+            return
+        prev_state = dict(self.kernel.state)
+        self._sim_tick()
+        self._prev_sim = prev_state
+        self.kernel.pump_acks()
+
+    def _inject_late_legacy(self):
+        """交换一份迟到的旧包：把最早保留的确认以旧格式重新注入。"""
+        pkt = self.kernel.craft_late_legacy_ack()
+        if pkt is None:
+            self.ui_log.insert(0, "尚无旧确认可注入")
+        else:
+            self.kernel.inject_ack(pkt)
+            self.ui_log.insert(0, "注入迟到旧包 ack=%d（确认点不动）"
+                               % pkt["ack"])
+        del self.ui_log[6:]
+
+    def _save_checkpoint(self):
+        data = self.kernel.save_checkpoint()
+        self.checkpoint_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=1),
+            encoding="utf-8")
+        self.ui_log.insert(0, "检查点已存： v%d 待重放 %d 条"
+                           % (data["version"], len(data["pending"])))
+        del self.ui_log[6:]
+
+    def _load_checkpoint(self):
+        try:
+            data = json.loads(self.checkpoint_path.read_text(
+                encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self.ui_log.insert(0, "读取检查点失败")
+            del self.ui_log[6:]
+            return
+        self.kernel = PredictionKernel.from_checkpoint(self.kernel.tr, data)
+        self._prev_sim = dict(self.kernel.state)
+        self._acc = 0.0
+        self.ui_log.insert(0, "检查点已恢复： 确认前缀=%d 待重放 %d 条"
+                           % (data["ack_prefix"], len(self.kernel.pending)))
+        del self.ui_log[6:]
+
     def _handle_click(self, pos):
         for key, btn in self.buttons.items():
             if btn.hit(pos):
@@ -379,6 +500,19 @@ class ClientUI:
                     self.ctrl.burst(8)
                 else:
                     self.ctrl.reset_stats()
+                return
+        for key, btn in self.debug_buttons.items():
+            if btn.hit(pos):
+                if key == "pause":
+                    self._toggle_pause()
+                elif key == "step":
+                    self._step_once()
+                elif key == "inject":
+                    self._inject_late_legacy()
+                elif key == "save":
+                    self._save_checkpoint()
+                elif key == "load":
+                    self._load_checkpoint()
                 return
         for key, sl in self.sliders.items():
             r = sl["r"].inflate(0, 14)
@@ -427,15 +561,17 @@ class ClientUI:
             if self.drag:
                 self._update_slider(self.drag, pygame.mouse.get_pos()[0])
 
-            # 固定步长推进模拟；渲染帧率独立
-            self._acc += frame_dt
-            steps = 0
-            while self._acc >= sim.TICK_DT and steps < 5:
-                prev_state = dict(self.kernel.state)
-                self._sim_tick()
-                self._prev_sim = prev_state
-                self._acc -= sim.TICK_DT
-                steps += 1
+            # 固定步长推进模拟；渲染帧率独立。暂停双方时本地停拍，
+            # 代理同时冻结链路（报文只排队不投递），用“逐拍”单步检查
+            if not self.paused:
+                self._acc += frame_dt
+                steps = 0
+                while self._acc >= sim.TICK_DT and steps < 5:
+                    prev_state = dict(self.kernel.state)
+                    self._sim_tick()
+                    self._prev_sim = prev_state
+                    self._acc -= sim.TICK_DT
+                    steps += 1
 
             self.ctrl.pump()
             self.kernel.pump_acks()
